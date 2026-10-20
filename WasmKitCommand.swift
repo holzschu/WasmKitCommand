@@ -78,7 +78,9 @@ public func wasmkit(argc: Int32, argv: UnsafeMutablePointer<UnsafeMutablePointer
                                             fileSystem: .host().withStdio(stdin:  fileno(thread_stdin),
                                                                           stdout:  fileno(thread_stdout),
                                                                           stderr:  fileno(thread_stderr))
-                                                .withPreopens([.init(guestPath: "/", hostPath: "/"),    .init(guestPath: "/dev", hostPath: "/dev")])
+                                                // Stdio is already mapped above. The extension sandbox denies
+                                                // opening /dev itself; requiring it would abort even hello.
+                                                .withPreopens([.init(guestPath: "/", hostPath: "/")])
             )
             // Start the WASI command-line application and close the bridge.
             let exitCode = try wasi.runAndClose { wasi in
