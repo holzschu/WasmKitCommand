@@ -31,6 +31,53 @@ func convertCArguments(argc: Int32, argv: UnsafeMutablePointer<UnsafeMutablePoin
     return args
 }
 
+// Host side of the ashell_v1 tty imports (include/ashell.h). Errors are negative WASI errno values.
+final class TTYBridge {
+    private var raw = false
+
+    func link(to imports: inout Imports, store: Store) {
+        imports.define(module: "ashell_v1", name: "tty_size",
+                       Function(store: store, parameters: [.i32], results: [.i32]) { caller, args in
+            [.i32(UInt32(bitPattern: self.size(caller: caller, pointer: args[0].i32)))]
+        })
+        imports.define(module: "ashell_v1", name: "tty_raw",
+                       Function(store: store, parameters: [.i32], results: [.i32]) { _, args in
+            [.i32(UInt32(bitPattern: self.setRaw(args[0].i32 != 0)))]
+        })
+    }
+
+    private func size(caller: borrowing Caller, pointer: UInt32) -> Int32 {
+        guard ios_isatty(fileno(thread_stdin)) != 0 else { return -59 }  // ENOTTY
+        guard let memory = caller.instance?.exports[memory: "memory"],
+              Int(pointer) + 8 <= memory.byteCount else { return -21 }   // EFAULT
+        // a-Shell publishes the window size in the session environment.
+        let columns = getenv("COLUMNS").flatMap { UInt32(String(cString: $0)) } ?? 80
+        let rows = getenv("LINES").flatMap { UInt32(String(cString: $0)) } ?? 24
+        memory.withUnsafeMutableBufferPointer(offset: UInt(pointer), count: 8) {
+            $0.storeBytes(of: columns.littleEndian, as: UInt32.self)
+            $0.storeBytes(of: rows.littleEndian, toByteOffset: 4, as: UInt32.self)
+        }
+        return 0
+    }
+
+    private func setRaw(_ enabled: Bool) -> Int32 {
+        guard ios_isatty(fileno(thread_stdin)) != 0 else { return -59 }  // ENOTTY
+        if enabled && !raw {
+            ios_startInteractive()
+        } else if !enabled && raw {
+            ios_stopInteractive()
+        }
+        raw = enabled
+        return 0
+    }
+
+    // Called when the program ends, whether by exit, Ctrl-C or a trap.
+    func restore() {
+        if raw { ios_stopInteractive() }
+        raw = false
+    }
+}
+
 @_cdecl("wasmkit")
 public func wasmkit(argc: Int32, argv: UnsafeMutablePointer<UnsafeMutablePointer<Int8>?>?) -> Int32 {
     guard let args = convertCArguments(argc: argc, argv: argv) else {
@@ -73,12 +120,16 @@ public func wasmkit(argc: Int32, argv: UnsafeMutablePointer<UnsafeMutablePointer
                 }
             }
             let currentDirectory = FileManager().currentDirectoryPath
+            let tty = TTYBridge()
+            defer { tty.restore() }
             let wasi = try WASIBridgeToHost(args: arguments,
                                             environment: environment,
                                             fileSystem: .host().withStdio(stdin:  fileno(thread_stdin),
                                                                           stdout:  fileno(thread_stdout),
                                                                           stderr:  fileno(thread_stderr))
-                                                .withPreopens([.init(guestPath: "/", hostPath: "/"),    .init(guestPath: "/dev", hostPath: "/dev")])
+                                                // Stdio is already mapped above. The extension sandbox denies
+                                                // opening /dev itself; requiring it would abort even hello.
+                                                .withPreopens([.init(guestPath: "/", hostPath: "/")])
             )
             // Start the WASI command-line application and close the bridge.
             let exitCode = try wasi.runAndClose { wasi in
@@ -88,6 +139,7 @@ public func wasmkit(argc: Int32, argv: UnsafeMutablePointer<UnsafeMutablePointer
                 // Instantiate a parsed module importing WASI
                 var imports = Imports()
                 wasi.link(to: &imports, store: store)
+                tty.link(to: &imports, store: store)
                 let instance = try module.instantiate(store: store, imports: imports)
                 return try wasi.start(instance)
             }
